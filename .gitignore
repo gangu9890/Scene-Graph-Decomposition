@@ -1,0 +1,21 @@
+# Large raw data files (re-generate with prepare_data.py)
+consolidated_indoor_top_sg_train.json
+consolidated_indoor_top_sg_test.json
+
+# Generated/intermediate files
+train_graphs.json
+_train_subset.json
+
+# Saved model weights
+model.pt
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
