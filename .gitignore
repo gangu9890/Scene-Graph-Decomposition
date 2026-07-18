@@ -1,6 +1,4 @@
 # Large raw data files (re-generate with prepare_data.py)
-consolidated_indoor_top_sg_train.json
-consolidated_indoor_top_sg_test.json
 
 # Generated/intermediate files
 train_graphs.json
