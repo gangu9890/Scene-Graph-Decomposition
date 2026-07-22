@@ -8,10 +8,10 @@ NUM_CLASSES = 178      # idx_to_label ids go up to 177 (+pad 0)
 NUM_RELS = 41          # idx_to_predicate ids go up to 40 (+pad 0)
 EMB_DIM = 64
 HID_DIM = 128
-MAX_POS_WEIGHT = 20.0   # clamp to keep BCE stable on graphs with very few positives
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[gnn_decompose] using device: {DEVICE}")
+
 
 class RelGraphConv(nn.Module):
     """One relational message-passing layer over object-object edges.
@@ -29,7 +29,7 @@ class RelGraphConv(nn.Module):
         """
         h: [N, dim]
         edge_index: LongTensor [E, 3] of (subj, rel, obj), already both
-            directions, or None/empty if there are no edges.
+            directions, or None if there are no edges.
         """
         out = self.self_loop(h)
         if edge_index is not None and edge_index.numel() > 0:
@@ -53,11 +53,9 @@ class SceneGraphEncoder(nn.Module):
         self.bbox_mlp = nn.Sequential(nn.Linear(4, emb_dim), nn.ReLU(), nn.Linear(emb_dim, emb_dim))
         self.in_proj = nn.Linear(emb_dim * 2, hid_dim)
         self.layers = nn.ModuleList([RelGraphConv(hid_dim, num_rels) for _ in range(num_layers)])
-        # attribute-value vocabulary shares the same class embedding space (ids 101-177)
         self.attr_proj = nn.Linear(emb_dim, hid_dim)
 
     def encode_nodes(self, nodes):
-        # nodes: [N,6] -> class_idx, cx, cy, w, h, connected
         cls = torch.tensor([n[0] for n in nodes], dtype=torch.long, device=DEVICE)
         bbox = torch.tensor([n[1:5] for n in nodes], dtype=torch.float32, device=DEVICE) / 500.0
         h0 = torch.cat([self.class_emb(cls), self.bbox_mlp(bbox)], dim=-1)
@@ -71,7 +69,7 @@ class SceneGraphEncoder(nn.Module):
         h = self.encode_nodes(nodes)
         if rel_edges:
             fwd = torch.tensor(rel_edges, dtype=torch.long, device=DEVICE)
-            bwd = fwd[:, [2, 1, 0]]  # (o, r, s) reverse direction
+            bwd = fwd[:, [2, 1, 0]]
             edge_index = torch.cat([fwd, bwd], dim=0)
         else:
             edge_index = None
@@ -80,32 +78,47 @@ class SceneGraphEncoder(nn.Module):
         return h
 
 
-class TripletScorer(nn.Module):
-    """Scores (query_node, candidate) pairs -> link prob + relation logits."""
+class DistMultScorer(nn.Module):
+    """Bilinear (DistMult-style) triplet scorer.
+    rel_logits[k, r] = <h_query * R_r, h_candidate_k>   (elementwise then dot)
+    link_logits[k]   = max_r rel_logits[k, r]            (does *some* relation fit)
+    """
     def __init__(self, hid_dim=HID_DIM, num_rels=NUM_RELS):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(hid_dim * 2, hid_dim), nn.ReLU(),
-            nn.Linear(hid_dim, hid_dim), nn.ReLU(),
-        )
-        self.link_head = nn.Linear(hid_dim, 1)
-        self.rel_head = nn.Linear(hid_dim, num_rels)
+        self.rel_emb = nn.Embedding(num_rels, hid_dim)
+        nn.init.xavier_uniform_(self.rel_emb.weight)
 
     def forward(self, q_emb, cand_emb):
-        # q_emb: [D]; cand_emb: [K,D] -> broadcast
-        x = torch.cat([q_emb.unsqueeze(0).expand_as(cand_emb), cand_emb], dim=-1)
-        feat = self.mlp(x)
-        return self.link_head(feat).squeeze(-1), self.rel_head(feat)
+        R = self.rel_emb.weight                      # [num_rels, D]
+        qr = q_emb.unsqueeze(0) * R                   # [num_rels, D]  (q (*) R_r)
+        rel_logits = qr @ cand_emb.t()                # [num_rels, K]
+        rel_logits = rel_logits.t()                   # [K, num_rels]
+        link_logits = rel_logits.max(dim=-1).values    # [K]
+        return link_logits, rel_logits
+
+
+class DegreeHead(nn.Module):
+    """Predicts a query node's own out-degree (# of triplets it appears in),
+    used at inference to decide how many top-scoring candidates to keep."""
+    def __init__(self, hid_dim=HID_DIM):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(hid_dim, hid_dim // 2), nn.ReLU(),
+            nn.Linear(hid_dim // 2, 1)
+        )
+
+    def forward(self, q_emb):
+        return self.mlp(q_emb).squeeze(-1)  # predicts log1p(degree)
 
 
 class GraphDecomposer(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = SceneGraphEncoder()
-        self.scorer = TripletScorer()
+        self.scorer = DistMultScorer()
+        self.degree_head = DegreeHead()
 
     def encode_graph(self, nodes, rel_edges):
-        """Run the encoder once; reuse the result across all queries for this graph."""
         return self.encoder(nodes, rel_edges)
 
     def score_query(self, h, attr_edges, query_idx):
@@ -116,7 +129,8 @@ class GraphDecomposer(nn.Module):
         cand_emb = torch.cat([h, attr_emb], dim=0) if attr_values else h
         q_emb = h[query_idx]
         link_logits, rel_logits = self.scorer(q_emb, cand_emb)
-        return link_logits, rel_logits, node_candidates, attr_values
+        pred_log_degree = self.degree_head(q_emb)
+        return link_logits, rel_logits, node_candidates, attr_values, pred_log_degree
 
     def forward(self, nodes, rel_edges, attr_edges, query_idx):
         h = self.encode_graph(nodes, rel_edges)
@@ -127,7 +141,7 @@ def build_labels(nodes, rel_edges, attr_edges, query_idx, node_candidates, attr_
     n = len(node_candidates)
     m = len(attr_values)
     link_y = torch.zeros(n + m, device=DEVICE)
-    rel_y = torch.full((n + m,), -100, dtype=torch.long, device=DEVICE)  # ignore_index for non-edges
+    rel_y = torch.full((n + m,), -100, dtype=torch.long, device=DEVICE)
     attr_pos = {v: n + i for i, v in enumerate(attr_values)}
     for s, r, o in rel_edges:
         if s == query_idx:
@@ -139,26 +153,33 @@ def build_labels(nodes, rel_edges, attr_edges, query_idx, node_candidates, attr_
             idx = attr_pos[v]
             link_y[idx] = 1.0; rel_y[idx] = r
     if query_idx < n:
-        link_y[query_idx] = 0.0  # no self-loop target
-    return link_y, rel_y
+        link_y[query_idx] = 0.0
+    true_degree = link_y.sum()
+    return link_y, rel_y, true_degree
 
 
-def decode_triplets(query_idx, node_candidates, attr_values, link_logits, rel_logits, threshold=0.5):
-    """Turn model scores back into human-readable triplet strings."""
-    probs = torch.sigmoid(link_logits).cpu()
+def decode_triplets_topk(query_idx, node_candidates, attr_values, link_logits, rel_logits,
+                          pred_log_degree, margin=0):
+    """Rank candidates by score, keep the top predicted-degree (+margin) of them."""
+    k = max(0, round(math.expm1(pred_log_degree.item())) + margin)
+    k = min(k, link_logits.numel())
+    if k == 0:
+        return []
+    scores = link_logits.cpu()
     rel_pred = rel_logits.argmax(-1).cpu()
     n = len(node_candidates)
+
+    order = torch.argsort(scores, descending=True).tolist()
+    order = [i for i in order if i != query_idx][:k]
+
     triplets = []
-    for i in range(len(probs)):
-        if i == query_idx:
-            continue
-        if probs[i] >= threshold:
-            r = rel_pred[i].item()
-            if i < n:
-                triplets.append(f"node{query_idx}-edge{r}-node{i}")
-            else:
-                v = attr_values[i - n]
-                triplets.append(f"node{query_idx}-edge{r}-attr{v}")
+    for i in order:
+        r = rel_pred[i].item()
+        if i < n:
+            triplets.append(f"node{query_idx}-edge{r}-node{i}")
+        else:
+            v = attr_values[i - n]
+            triplets.append(f"node{query_idx}-edge{r}-attr{v}")
     return triplets
 
 
@@ -174,11 +195,11 @@ def load_graphs(path, limit=None):
 
 
 def train(train_path, epochs=20, lr=1e-3, limit=None, save_path="model.pt",
-          max_queries_per_graph=None):
+          max_queries_per_graph=None, degree_loss_weight=0.1):
     """
-    max_queries_per_graph: cap on how many query nodes to train on per graph
-    per epoch (None = use every node). Only needed if you have very large
-    graphs and want to bound per-epoch compute; leave None for full coverage.
+    limit=None trains on the FULL file (fix #1). max_queries_per_graph caps
+    per-graph query count only if you need to bound compute on very large
+    graphs; leave None for full node coverage per epoch (fix from v2).
     """
     graphs = load_graphs(train_path, limit=limit)
     model = GraphDecomposer().to(DEVICE)
@@ -201,19 +222,23 @@ def train(train_path, epochs=20, lr=1e-3, limit=None, save_path="model.pt",
 
             graph_loss = 0.0
             for query_idx in query_indices:
-                link_logits, rel_logits, node_c, attr_v = model.score_query(h, attr_edges, query_idx)
-                link_y, rel_y = build_labels(nodes, rel_edges, attr_edges, query_idx, node_c, attr_v)
+                link_logits, rel_logits, node_c, attr_v, pred_log_deg = model.score_query(h, attr_edges, query_idx)
+                link_y, rel_y, true_degree = build_labels(nodes, rel_edges, attr_edges, query_idx, node_c, attr_v)
 
                 num_pos = link_y.sum()
                 num_neg = link_y.numel() - num_pos
-                pos_weight = torch.clamp(num_neg / num_pos.clamp(min=1), max=MAX_POS_WEIGHT) if num_pos > 0 else torch.tensor(1.0, device=DEVICE)
+                pos_weight = torch.clamp(num_neg / num_pos.clamp(min=1), max=20.0) if num_pos > 0 else torch.tensor(1.0, device=DEVICE)
                 loss_link = F.binary_cross_entropy_with_logits(link_logits, link_y, pos_weight=pos_weight)
 
                 pos_mask = rel_y != -100
                 loss_rel = (F.cross_entropy(rel_logits[pos_mask], rel_y[pos_mask])
                             if pos_mask.any() else torch.tensor(0.0, device=DEVICE))
-                graph_loss = graph_loss + loss_link + loss_rel
-                total_loss += (loss_link.item() + (loss_rel.item() if pos_mask.any() else 0.0))
+
+                loss_degree = F.mse_loss(pred_log_deg, torch.log1p(true_degree))
+
+                q_loss = loss_link + loss_rel + degree_loss_weight * loss_degree
+                graph_loss = graph_loss + q_loss
+                total_loss += q_loss.item()
                 steps += 1
 
             if len(query_indices) > 0:
@@ -227,17 +252,16 @@ def train(train_path, epochs=20, lr=1e-3, limit=None, save_path="model.pt",
 
 
 @torch.no_grad()
-def infer(model, graph, query_idx, threshold=0.5):
+def infer(model, graph, query_idx, margin=0):
     nodes, rel_edges, attr_edges = graph["nodes"], graph["rel_edges"], graph["attr_edges"]
-    link_logits, rel_logits, node_c, attr_v = model(nodes, rel_edges, attr_edges, query_idx)
-    return decode_triplets(query_idx, node_c, attr_v, link_logits, rel_logits, threshold)
+    link_logits, rel_logits, node_c, attr_v, pred_log_deg = model(nodes, rel_edges, attr_edges, query_idx)
+    return decode_triplets_topk(query_idx, node_c, attr_v, link_logits, rel_logits, pred_log_deg, margin)
 
 
 @torch.no_grad()
-def _collect_predictions(model, graphs, threshold, max_graphs=None, all_nodes=True):
-    """Shared scoring loop used by both evaluate() and find_best_threshold().
-    Returns tp/fp/fn counts at the given threshold, evaluated over every node
-    in every graph (not just one random node) for a stable estimate."""
+def evaluate(model, graphs, margin=0, max_graphs=300, all_nodes=True):
+    """Edge-level precision/recall using adaptive top-k decoding (fix #3),
+    evaluated over every node per graph by default."""
     tp = fp = fn = 0
     use_graphs = graphs[:max_graphs] if max_graphs else graphs
     for g in use_graphs:
@@ -254,8 +278,8 @@ def _collect_predictions(model, graphs, threshold, max_graphs=None, all_nodes=Tr
             for s, r, v in g["attr_edges"]:
                 if s == q: gt.add((r, v, "a"))
 
-            link_logits, rel_logits, node_c, attr_v = model.score_query(h, g["attr_edges"], q)
-            preds = decode_triplets(q, node_c, attr_v, link_logits, rel_logits, threshold)
+            link_logits, rel_logits, node_c, attr_v, pred_log_deg = model.score_query(h, g["attr_edges"], q)
+            preds = decode_triplets_topk(q, node_c, attr_v, link_logits, rel_logits, pred_log_deg, margin)
 
             pred = set()
             for p in preds:
@@ -267,29 +291,21 @@ def _collect_predictions(model, graphs, threshold, max_graphs=None, all_nodes=Tr
                 else:
                     pred.add((r, int(tgt.replace("attr", "")), "a"))
             tp += len(gt & pred); fp += len(pred - gt); fn += len(gt - pred)
-    return tp, fp, fn
-
-
-def evaluate(model, graphs, threshold=0.4, max_graphs=300, all_nodes=True):
-    """Edge-level precision/recall, evaluated over every node per graph by default
-    (set all_nodes=False to reproduce the older one-random-node-per-graph metric)."""
-    tp, fp, fn = _collect_predictions(model, graphs, threshold, max_graphs, all_nodes)
     prec = tp / max(tp + fp, 1); rec = tp / max(tp + fn, 1)
     f1 = 2 * prec * rec / max(prec + rec, 1e-9)
-    print(f"threshold={threshold:.2f}  precision={prec:.3f}  recall={rec:.3f}  f1={f1:.3f}  (tp={tp} fp={fp} fn={fn})")
+    print(f"margin={margin}  precision={prec:.3f}  recall={rec:.3f}  f1={f1:.3f}  (tp={tp} fp={fp} fn={fn})")
     return prec, rec, f1
 
 
-def find_best_threshold(model, val_graphs, thresholds=None, max_graphs=300):
-    """Sweep thresholds on a held-out split and return the one maximizing F1."""
-    if thresholds is None:
-        thresholds = [round(t, 2) for t in torch.arange(0.1, 0.91, 0.05).tolist()]
-    best = (0.5, 0.0, 0.0, 0.0)  # threshold, precision, recall, f1
-    for t in thresholds:
-        prec, rec, f1 = evaluate(model, val_graphs, threshold=t, max_graphs=max_graphs)
+def find_best_margin(model, val_graphs, margins=range(-1, 3), max_graphs=300):
+    """Sweep the +/- slack applied to the predicted degree and pick the best F1.
+    margin=0 trusts the degree head exactly; negative/positive shifts it."""
+    best = (0, 0.0, 0.0, 0.0)
+    for m in margins:
+        prec, rec, f1 = evaluate(model, val_graphs, margin=m, max_graphs=max_graphs)
         if f1 > best[3]:
-            best = (t, prec, rec, f1)
-    print(f"\nbest threshold={best[0]:.2f}  precision={best[1]:.3f}  recall={best[2]:.3f}  f1={best[3]:.3f}")
+            best = (m, prec, rec, f1)
+    print(f"\nbest margin={best[0]}  precision={best[1]:.3f}  recall={best[2]:.3f}  f1={best[3]:.3f}")
     return best[0]
 
 
@@ -298,13 +314,11 @@ if __name__ == "__main__":
     train_graphs_path = here / "train_graphs.json"
     test_graphs_path  = here / "test_graphs.json"
 
-    # Auto-generate train_graphs.json if prepare_data.py hasn't been run yet.
     if not train_graphs_path.exists():
         import subprocess, sys
         print("train_graphs.json not found - running prepare_data.py first...")
         subprocess.run([sys.executable, str(here / "prepare_data.py")], check=True)
 
-    # Use proper train / test splits (produced by prepare_data.py).
     with open(test_graphs_path) as f:
         eval_graphs = list(json.load(f).values())
 
@@ -314,15 +328,12 @@ if __name__ == "__main__":
     print("nodes:", [n[0] for n in g["nodes"]])
     print("ground truth targets for node0:", g["query_targets"].get("0"))
 
-    # Split eval_graphs into a threshold-search half and a final-report half
-    # so the reported metric isn't tuned on the same data it's measured on.
     random.shuffle(eval_graphs)
     half = len(eval_graphs) // 2
-    thresh_search_graphs, final_report_graphs = eval_graphs[:half], eval_graphs[half:]
+    margin_search_graphs, final_report_graphs = eval_graphs[:half], eval_graphs[half:]
 
-    best_t = find_best_threshold(model, thresh_search_graphs)
-    print(f"\nmodel prediction for node0 (best threshold={best_t:.2f}):",
-          infer(model, g, 0, threshold=best_t))
+    best_m = find_best_margin(model, margin_search_graphs)
+    print(f"\nmodel prediction for node0 (margin={best_m}):", infer(model, g, 0, margin=best_m))
 
     print("\nfinal held-out metrics:")
-    evaluate(model, final_report_graphs, threshold=best_t)
+    evaluate(model, final_report_graphs, margin=best_m)
