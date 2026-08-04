@@ -2,6 +2,7 @@
 
 # Generated/intermediate files
 train_graphs.json
+test_graphs.json
 _train_subset.json
 
 # Saved model weights
